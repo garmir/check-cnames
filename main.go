@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"flag"
 	"fmt"
 	"math/rand"
 	"net"
@@ -13,124 +15,260 @@ import (
 	"github.com/miekg/dns"
 )
 
-func main() {
+type Config struct {
+	concurrency int
+	timeout     time.Duration
+	verbose     bool
+	resolvers   []string
+	retries     int
+}
 
-	servers := []string{
-		//"209.244.0.3",
-		//"209.244.0.4",
-		//"64.6.64.6",
-		//"64.6.65.6",
-		"8.8.8.8",
-		"8.8.4.4",
-		"9.9.9.9",
-		//	"149.112.112.112",
-		//	"84.200.69.80",
-		//	"84.200.70.40",
-		//	"8.26.56.26",
-		//	"8.20.247.20",
-		//	"208.67.222.222",
-		//	"208.67.220.220",
-		//	"199.85.126.10",
-		//	"199.85.127.10",
-		//	"81.218.119.11",
-		//	"209.88.198.133",
-		//	"195.46.39.39",
-		//	"195.46.39.40",
-		//	"69.195.152.204",
-		//	"23.94.60.240",
-		//	"208.76.50.50",
-		//	"208.76.51.51",
-		//	"216.146.35.35",
-		//	"216.146.36.36",
-		//	"37.235.1.174",
-		//	"37.235.1.177",
-		//	"198.101.242.72",
-		//	"23.253.163.53",
-		//	"77.88.8.8",
-		//	"77.88.8.1",
-		//	"91.239.100.100",
-		//	"89.233.43.71",
-		//	"74.82.42.42",
-		//	"109.69.8.51",
-		//	"156.154.70.1",
-		//	"156.154.71.1",
-		"1.1.1.1",
-		"1.0.0.1",
-		//	"45.77.165.194",
+var config Config
+
+func init() {
+	flag.IntVar(&config.concurrency, "c", 20, "Number of concurrent workers")
+	flag.DurationVar(&config.timeout, "t", 5*time.Second, "DNS query timeout")
+	flag.BoolVar(&config.verbose, "v", false, "Verbose output (show errors)")
+	flag.IntVar(&config.retries, "r", 2, "Number of retries for failed queries")
+}
+
+func main() {
+	flag.Parse()
+
+	// Default DNS resolvers - using reliable public resolvers
+	config.resolvers = []string{
+		"1.1.1.1",       // Cloudflare
+		"1.0.0.1",       // Cloudflare
+		"8.8.8.8",       // Google
+		"8.8.4.4",       // Google
+		"9.9.9.9",       // Quad9
+		"149.112.112.112", // Quad9
+		"208.67.222.222", // OpenDNS
+		"208.67.220.220", // OpenDNS
 	}
 
-	rand.Seed(time.Now().Unix())
+	rand.Seed(time.Now().UnixNano())
 
-	type job struct{ domain, server string }
-	jobs := make(chan job)
+	type job struct {
+		domain string
+		server string
+	}
+	
+	jobs := make(chan job, config.concurrency*2)
+	results := make(chan string, config.concurrency)
 
 	var wg sync.WaitGroup
-	for i := 0; i < 20; i++ {
+	ctx := context.Background()
+
+	// Start workers
+	for i := 0; i < config.concurrency; i++ {
 		wg.Add(1)
-
-		go func() {
-			for j := range jobs {
-
-				cname, err := getCNAME(j.domain, j.server)
-				if err != nil {
-					//fmt.Println(err)
-					continue
-				}
-
-				if !resolves(cname) {
-					fmt.Printf("%s does not resolve (pointed at by %s)\n", cname, j.domain)
-				}
-			}
-			wg.Done()
-		}()
+		go worker(ctx, jobs, results, &wg)
 	}
 
-	sc := bufio.NewScanner(os.Stdin)
+	// Start result printer
+	go func() {
+		for result := range results {
+			fmt.Println(result)
+		}
+	}()
 
-	for sc.Scan() {
-		target := strings.ToLower(strings.TrimSpace(sc.Text()))
-		if target == "" {
+	// Read domains from stdin
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+		domain := strings.ToLower(strings.TrimSpace(scanner.Text()))
+		if domain == "" {
 			continue
 		}
-		server := servers[rand.Intn(len(servers))]
-
-		jobs <- job{target, server}
+		
+		// Select random resolver for load distribution
+		server := config.resolvers[rand.Intn(len(config.resolvers))]
+		jobs <- job{domain: domain, server: server}
 	}
+
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading input: %v\n", err)
+	}
+
 	close(jobs)
-
 	wg.Wait()
-
+	close(results)
 }
 
-func resolves(domain string) bool {
-	_, err := net.LookupHost(domain)
-	return err == nil
+func worker(ctx context.Context, jobs <-chan job, results chan<- string, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	for j := range jobs {
+		processDomain(ctx, j.domain, j.server, results)
+	}
 }
 
-func getCNAME(domain, server string) (string, error) {
-	c := dns.Client{}
+func processDomain(ctx context.Context, domain, server string, results chan<- string) {
+	cname, err := getCNAMEWithRetry(ctx, domain, server)
+	if err != nil {
+		if config.verbose {
+			fmt.Fprintf(os.Stderr, "Error querying %s: %v\n", domain, err)
+		}
+		return
+	}
 
-	m := dns.Msg{}
-	if domain[len(domain)-1:] != "." {
+	// Check if CNAME exists
+	if cname == "" {
+		if config.verbose {
+			fmt.Fprintf(os.Stderr, "No CNAME for %s\n", domain)
+		}
+		return
+	}
+
+	// Check if CNAME resolves
+	if !resolves(ctx, cname) {
+		results <- fmt.Sprintf("[DANGLING] %s -> %s (does not resolve)", domain, cname)
+		
+		// Check for potential subdomain takeover services
+		service := checkVulnerableService(cname)
+		if service != "" {
+			results <- fmt.Sprintf("[TAKEOVER] %s -> %s (vulnerable: %s)", domain, cname, service)
+		}
+	} else if config.verbose {
+		results <- fmt.Sprintf("[OK] %s -> %s", domain, cname)
+	}
+}
+
+func getCNAMEWithRetry(ctx context.Context, domain, server string) (string, error) {
+	var lastErr error
+	
+	for i := 0; i <= config.retries; i++ {
+		cname, err := getCNAME(ctx, domain, server)
+		if err == nil {
+			return cname, nil
+		}
+		lastErr = err
+		
+		if i < config.retries {
+			time.Sleep(time.Millisecond * 100 * time.Duration(i+1))
+		}
+	}
+	
+	return "", lastErr
+}
+
+func getCNAME(ctx context.Context, domain, server string) (string, error) {
+	c := &dns.Client{
+		Timeout: config.timeout,
+		Net:     "udp",
+	}
+
+	m := &dns.Msg{}
+	if !strings.HasSuffix(domain, ".") {
 		domain += "."
 	}
 	m.SetQuestion(domain, dns.TypeCNAME)
 	m.RecursionDesired = true
 
-	r, _, err := c.Exchange(&m, server+":53")
+	r, _, err := c.ExchangeContext(ctx, m, server+":53")
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("DNS query failed: %w", err)
 	}
 
-	if len(r.Answer) == 0 {
-		return "", fmt.Errorf("no answers for %s", domain)
-	}
-
+	// First check for CNAME records
 	for _, ans := range r.Answer {
-		if r, ok := ans.(*dns.CNAME); ok {
-			return r.Target, nil
+		if cname, ok := ans.(*dns.CNAME); ok {
+			return strings.TrimSuffix(cname.Target, "."), nil
 		}
 	}
-	return "", fmt.Errorf("no cname for %s", domain)
 
+	// If no CNAME in answer, check if there's an A record (no CNAME)
+	for _, ans := range r.Answer {
+		if _, ok := ans.(*dns.A); ok {
+			return "", nil // Domain has A record, no CNAME
+		}
+	}
+
+	// Check authority section for SOA (NXDOMAIN or no records)
+	if len(r.Ns) > 0 {
+		for _, ns := range r.Ns {
+			if _, ok := ns.(*dns.SOA); ok {
+				return "", nil // No CNAME exists
+			}
+		}
+	}
+
+	return "", nil
+}
+
+func resolves(ctx context.Context, domain string) bool {
+	// Remove trailing dot if present
+	domain = strings.TrimSuffix(domain, ".")
+	
+	// Try to resolve with timeout
+	resolver := &net.Resolver{
+		PreferGo: true,
+	}
+	
+	ctx, cancel := context.WithTimeout(ctx, config.timeout)
+	defer cancel()
+	
+	_, err := resolver.LookupHost(ctx, domain)
+	return err == nil
+}
+
+func checkVulnerableService(cname string) string {
+	cname = strings.ToLower(cname)
+	
+	// Common subdomain takeover vulnerable services
+	vulnerablePatterns := map[string]string{
+		".s3.amazonaws.com":           "AWS S3",
+		".s3-website":                 "AWS S3",
+		".s3.dualstack":              "AWS S3",
+		".cloudfront.net":            "AWS CloudFront",
+		".elasticbeanstalk.com":      "AWS Elastic Beanstalk",
+		".herokuapp.com":             "Heroku",
+		".herokudns.com":             "Heroku",
+		".wordpress.com":             "WordPress",
+		".pantheonsite.io":           "Pantheon",
+		".github.io":                 "GitHub Pages",
+		".gitlab.io":                 "GitLab Pages",
+		".surge.sh":                  "Surge.sh",
+		".bitbucket.io":              "Bitbucket",
+		".zendesk.com":               "Zendesk",
+		".desk.com":                  "Desk.com",
+		".fastly.net":                "Fastly",
+		".feedpress.me":              "FeedPress",
+		".ghost.io":                  "Ghost",
+		".helpjuice.com":             "Helpjuice",
+		".helpscoutdocs.com":         "HelpScout",
+		".azurewebsites.net":         "Azure",
+		".cloudapp.azure.com":        "Azure",
+		".cloudapp.net":              "Azure",
+		".trafficmanager.net":        "Azure Traffic Manager",
+		".blob.core.windows.net":     "Azure Blob",
+		".azureedge.net":             "Azure CDN",
+		".azure-api.net":             "Azure API Management",
+		".azurefd.net":               "Azure Front Door",
+		".statuspage.io":             "StatusPage",
+		".uservoice.com":             "UserVoice",
+		".smartling.com":             "Smartling",
+		".tictail.com":               "Tictail",
+		".campaignmonitor.com":       "Campaign Monitor",
+		".createsend.com":            "CreateSend",
+		".acquia-sites.com":          "Acquia",
+		".proposify.biz":             "Proposify",
+		".simplebooklet.com":         "Simplebooklet",
+		".getresponse.com":           "GetResponse",
+		".vend.com":                  "Vend",
+		".jetbrains.space":           "JetBrains Space",
+		".myjetbrains.com":           "JetBrains",
+		".netlify.app":               "Netlify",
+		".netlify.com":               "Netlify",
+		".vercel.app":                "Vercel",
+		".now.sh":                    "Vercel",
+	}
+
+	for pattern, service := range vulnerablePatterns {
+		if strings.Contains(cname, pattern) {
+			return service
+		}
+	}
+
+	return ""
 }
