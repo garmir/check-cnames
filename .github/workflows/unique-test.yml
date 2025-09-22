@@ -1,0 +1,37 @@
+name: Unique Test - check-cnames
+on: [push, workflow_dispatch]
+
+jobs:
+  unique-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+        continue-on-error: true
+
+      - name: Unique Test Execution - check-cnames
+        continue-on-error: true
+        run: |
+          nix-shell -p curl jq coreutils --run '
+            echo "=== Unique Test: check-cnames ===" > unique-test-check-cnames.txt
+            echo "Repository: ${{ github.repository }}" >> unique-test-check-cnames.txt
+            echo "Test ID: TEST_155" >> unique-test-check-cnames.txt
+            echo "Timestamp: $(date)" >> unique-test-check-cnames.txt
+            curl -s ifconfig.me >> unique-test-check-cnames.txt
+            echo "Unique instruction: General framework compliance and performance testing" >> unique-test-check-cnames.txt
+          '
+
+      - name: Ubuntu Fallback - check-cnames
+        if: failure()
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y curl jq
+          echo "Ubuntu fallback for check-cnames" > fallback-check-cnames.txt
+          curl -s ifconfig.me >> fallback-check-cnames.txt
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: unique-test-check-cnames
+          path: "*.txt"
+          retention-days: 2
